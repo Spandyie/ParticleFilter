@@ -2,11 +2,11 @@ import numpy as np
 from scipy.stats import lognorm
 import matplotlib.pyplot as  plt
 
-
+"""Author: Spandan Mishra. Particle filter based remaining useful life estimaton"""
 class ParticleFilter:
     def __init__(self, num_particles):
         self.number_particles = num_particles
-        self.threshold = 0.0433
+        self.threshold = 0.015
         self.actual_crack = np.random.normal(loc=0.01, scale=5e-4, size=self.number_particles)
         self.m = np.random.normal(loc=4.0, scale=0.2, size=self.number_particles)
         self.c = np.random.normal(loc=-22.33, scale=1.12, size=self.number_particles)
@@ -89,20 +89,41 @@ class ParticleFilter:
         return prob_failure
 
 
+class RemainingUsefulLife:
+    def __init__(self, all_predictions, total_time, percentile, threshold):
+        self.predictions = all_predictions
+        self.total_time = total_time
+        self.percentile = percentile
+        self.threshold = threshold
+        self.RUL =[]
 
-if __name__ == "__main__":
-    measured_crack = [0.0119, 0.0103, 0.0118, 0.0095,0.0085,0.0122, 0.011,0.153,0.160,0.170,0.2,0.21,1.29,1.3,3,4]
-    all_predictions= []
-    number_particles = 5000
+    def getRUL(self, t):
+        N = len(self.total_time)
+        for i in range(self.predictions.shape[1]):
+            loc = np.argmax(self.predictions[:, i] > self.threshold)
+            if loc == 0:   # case when simulation does not exceed threshold
+                temp = self.total_time[N-1] - self.total_time[t-1]
+            else:#case when it exceeds threshold
+                temp = self.total_time[loc-1] - self.total_time[t-1]
+            self.RUL.append(temp)
+        return self.RUL
+
+
+
+
+def main(number_particles=5000, measured_crack=[]):
+    measured_crack = measured_crack
+    all_predictions = []
+    number_particles = number_particles
     part_obj = ParticleFilter(number_particles)
-    measured_data_iterator =0
+    measured_data_iterator = 0
     time_array = []
     init_time = 0
-    average_crack=[]
+    average_crack = []
     average_variance = []
     prob_failure = []
-    weights = np.full(shape=number_particles, fill_value= 1. / number_particles)
-    mu , var = 0.0, 0.0
+    weights = np.full(shape=number_particles, fill_value=1. / number_particles)
+    mu, var = 0.0, 0.0
     while mu < part_obj.threshold:
         if measured_data_iterator < len(measured_crack):
             for meas in measured_crack:
@@ -110,9 +131,10 @@ if __name__ == "__main__":
                 part_obj.predict()
                 # update the priors using likelikehood and we obtain posterior
                 part_obj.update(weights=weights, measured=meas)
-                if part_obj.neff(weights) < number_particles/2:
+                if part_obj.neff(weights) < number_particles / 2:
                     part_obj.resampleFromIndex(weights)
-                    assert np.allclose(weights, 1/number_particles)
+                    assert np.allclose(weights, 1 / number_particles)
+                all_predictions.append(part_obj.get_prediction())
                 mu, var = part_obj.estimate(weights)
                 if mu >= part_obj.threshold:
                     break
@@ -129,6 +151,7 @@ if __name__ == "__main__":
             part_obj.predict()
             part_obj.resampleFromIndex(weights)
             mu, var = part_obj.estimate(weights)
+            all_predictions.append(part_obj.get_prediction())
             if mu >= part_obj.threshold:
                 break
             average_crack.append(mu)
@@ -138,24 +161,33 @@ if __name__ == "__main__":
             prob_failure.append(part_obj.prognosis)
             measured_data_iterator += 1
 
-    Ub = [x+ 1.96 * np.sqrt(y) for x, y in zip(average_crack, average_variance)]
-    Lb = [0.0 if x - 1.96 * np.sqrt(y) < 0  else x - 1.96 * np.sqrt(y) for x, y in zip(average_crack, average_variance)]
+    all_predictions = np.vstack(all_predictions)
+
+    remain_obj = RemainingUsefulLife(all_predictions, time_array, [], 0.043)
+    opt = remain_obj.getRUL(len(measured_crack))
+
+    Ub = [x + 1.96 * np.sqrt(y) for x, y in zip(average_crack, average_variance)]
+    Lb = [0.0 if x - 1.96 * np.sqrt(y) < 0 else x - 1.96 * np.sqrt(y) for x, y in zip(average_crack, average_variance)]
     plt.figure()
     plt.plot(time_array, average_crack, 'b')
-    plt.plot(time_array, Lb,"g")
-    plt.plot(time_array, Ub,"r")
+    plt.plot(time_array, Lb, "g")
+    plt.plot(time_array, Ub, "r")
     plt.xlabel("Cycles")
     plt.ylabel("Crack Size")
     plt.show()
 
     # Fragility
     plt.figure()
-    plt.plot(time_array, prob_failure,'k')
+    plt.plot(time_array, prob_failure, 'k')
     plt.xlabel("Cycles")
     plt.ylabel("Prob failure")
     plt.show()
 
 
+    plt.figure()
+    plt.hist(opt)
+    plt.show()
 
-
-
+if __name__ == "__main__":
+    measured_crack = [0.0119, 0.0103]
+    main(number_particles=100000, measured_crack=measured_crack)
