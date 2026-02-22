@@ -1,92 +1,108 @@
 import numpy as np
 from scipy.stats import lognorm
-import matplotlib.pyplot as  plt
+import matplotlib.pyplot as plt
+from abc import ABC, abstractmethod
 
-"""Author: Spandan Mishra. Particle filter based remaining useful life estimaton"""
-class ParticleFilter:
-    def __init__(self, num_particles):
-        self.number_particles = num_particles
-        self.threshold = 0.015
-        self.actual_crack = np.random.normal(loc=0.01, scale=5e-4, size=self.number_particles)
-        self.m = np.random.normal(loc=4.0, scale=0.2, size=self.number_particles)
-        self.c = np.random.normal(loc=-22.33, scale=1.12, size=self.number_particles)
-        self.sigma = 0.001
+"""Author: Spandan Mishra. Particle filter based remaining useful life estimation"""
 
 
-    def predict(self):
-        predicted_crack = ParticleFilter.getCrack(self.actual_crack, self.m, self.c)
-        self.actual_crack = predicted_crack
+class StateSpaceModel(ABC):
+    @abstractmethod
+    def sample_initial(self, num_particles: int) -> np.ndarray:
+        """Return (N, d) array of initial particles."""
 
-    def update(self, weights, measured):
-        weights *= ParticleFilter.likelihood(measured, self.actual_crack, self.sigma)
-        weights += 1.e-300 # avoid round off to zero
-        weights /= np.sum(weights)                                     # normalizing the weights
+    @abstractmethod
+    def transition(self, particles: np.ndarray) -> np.ndarray:
+        """Propagate particles one step forward. Return (N, d)."""
 
-    def resampleFromIndex(self, weights):
-        temp_m = ParticleFilter.simpleResample(particles=self.m, weights=weights)
-        temp_c = ParticleFilter.simpleResample(particles=self.c, weights=weights)
-        actual_predicted_crack = ParticleFilter.simpleResample(particles=self.actual_crack, weights=weights)
-        self.actual_crack = actual_predicted_crack
-        self.m, self.c = temp_m, temp_c
+    @abstractmethod
+    def likelihood(self, measurement, particles: np.ndarray) -> np.ndarray:
+        """Return (N,) likelihood of measurement given each particle."""
 
-    @staticmethod
-    def neff(weights):
-        """if no new measurements. do not resample
-        if Neff fall below some threshold it is time to resample.
-         Useful starting point is N/2. We could also use N"""
-        return 1./ np.sum(np.square(weights))
-
-    @staticmethod
-    def getCrack(previous_crack, m, C):
-        stress_range = 78
-        dN = 50
-        stress_range_old_crack = stress_range * np.sqrt(np.pi * previous_crack)
-        left = np.exp(C) * np.power(stress_range_old_crack, m) * dN
-        return left + previous_crack
-
-    @staticmethod
-    def likelihood(measured_crack, actual_crack, std_dev):
-        sigma = np.sqrt(np.log(1 + np.power(std_dev / actual_crack, 2)))
-        mu = np.log(actual_crack) - 0.5 * np.power(sigma, 2)
-        return lognorm.pdf(measured_crack, s=sigma, loc=mu,scale=1).reshape(-1)
-
-    def get_prediction(self):
-        return self.actual_crack
-
-    def get_posterior_pred(self):
-        """Posterior predictive model"""
-        self.predict()
-        previous_crack = self.get_prediction()
-        stdev = self.sigma
-        sigma = np.sqrt(np.log(1 + np.power(stdev / previous_crack, 2)))
-        mu = np.log(previous_crack) - 0.5 * np.power(sigma, 2)
-        posterior_crack_dist = np.random.lognormal(mean=mu, sigma=sigma, size=self.number_particles).reshape(-1)
-        self.actual_crack = posterior_crack_dist
-
-
-    @staticmethod
-    def simpleResample(particles, weights):
-        N = len(particles)
-        cumulative_sum = np.cumsum(weights)
-        cumulative_sum[-1] = 1
-        indexes = np.searchsorted(cumulative_sum, np.random.rand(N))
-        # Resample according to index
-        particles[:] = particles[indexes]
-        weights.fill(1.0 / N)
-        return particles
-
-    def estimate(self, weight):
-        mean = np.mean(self.actual_crack)
-        var = np.var(self.actual_crack)
+    def estimate(self, particles: np.ndarray, weights: np.ndarray):
+        """Return (mean, var) — default uses weighted mean over all dims."""
+        mean = np.average(particles, weights=weights, axis=0)
+        var = np.average((particles - mean) ** 2, weights=weights, axis=0)
         return mean, var
 
-    @property
-    def prognosis(self):
-        """This functions gives the probablity of failure of structure at any given point"""
-        all_predictions = self.get_prediction()
-        values_exceeding_threshold = all_predictions > self.threshold
-        prob_failure = np.sum(values_exceeding_threshold) / len(all_predictions)
-        return prob_failure
+
+class ParticleFilter:
+    def __init__(self, num_particles: int, model: StateSpaceModel):
+        self.num_particles = num_particles
+        self.model = model
+        self.particles = model.sample_initial(num_particles)   # shape (N, d)
+        self.weights = np.full(num_particles, 1.0 / num_particles)
+
+    def predict(self):
+        self.particles = self.model.transition(self.particles)
+
+    def update(self, measurement):
+        self.weights *= self.model.likelihood(measurement, self.particles)
+        self.weights += 1e-300  # avoid round-off to zero
+        self.weights /= np.sum(self.weights)
+
+    def resample(self):
+        N = self.num_particles
+        cumulative_sum = np.cumsum(self.weights)
+        cumulative_sum[-1] = 1.0
+        indexes = np.searchsorted(cumulative_sum, np.random.rand(N))
+        self.particles = self.particles[indexes]  # fancy indexing → new array
+        self.weights.fill(1.0 / N)
+
+    def resample_if_needed(self):
+        if self.neff() < self.num_particles / 2:
+            self.resample()
+
+    def neff(self):
+        return 1.0 / np.sum(np.square(self.weights))
+
+    def estimate(self):
+        return self.model.estimate(self.particles, self.weights)
+
+    def get_particles(self):
+        return self.particles.copy()
+
+    def prognosis(self, threshold):
+        """Fraction of particles (crack size, column 0) exceeding threshold."""
+        crack = self.particles[:, 0]
+        return np.sum(crack > threshold) / self.num_particles
+
+
+class CrackGrowthModel(StateSpaceModel):
+    """Paris' Law fatigue crack growth model.
+
+    State columns: [:, 0] = crack size, [:, 1] = m, [:, 2] = c
+    """
+
+    def __init__(self, sigma=0.001, stress_range=78, dN=50, threshold=0.015):
+        self.sigma = sigma
+        self.stress_range = stress_range
+        self.dN = dN
+        self.threshold = threshold
+
+    def sample_initial(self, num_particles: int) -> np.ndarray:
+        crack = np.random.normal(loc=0.01, scale=5e-4, size=num_particles)
+        m = np.random.normal(loc=4.0, scale=0.2, size=num_particles)
+        c = np.random.normal(loc=-22.33, scale=1.12, size=num_particles)
+        return np.column_stack([crack, m, c])
+
+    def transition(self, particles: np.ndarray) -> np.ndarray:
+        crack = particles[:, 0]
+        m = particles[:, 1]
+        c = particles[:, 2]
+        da = np.exp(c) * np.power(self.stress_range * np.sqrt(np.pi * crack), m) * self.dN
+        particles[:, 0] = crack + da
+        return particles
+
+    def likelihood(self, measurement, particles: np.ndarray) -> np.ndarray:
+        crack = particles[:, 0]
+        sigma_ln = np.sqrt(np.log(1 + np.power(self.sigma / crack, 2)))
+        mu_ln = np.log(crack) - 0.5 * np.power(sigma_ln, 2)
+        return lognorm.pdf(measurement, s=sigma_ln, loc=mu_ln, scale=1).reshape(-1)
+
+    def estimate(self, particles: np.ndarray, weights: np.ndarray):
+        crack = particles[:, 0]
+        return np.mean(crack), np.var(crack)
 
 
 class RemainingUsefulLife:
@@ -95,70 +111,61 @@ class RemainingUsefulLife:
         self.total_time = total_time
         self.percentile = percentile
         self.threshold = threshold
-        self.RUL =[]
+        self.RUL = []
 
     def getRUL(self, t):
         N = len(self.total_time)
         for i in range(self.predictions.shape[1]):
             loc = np.argmax(self.predictions[:, i] > self.threshold)
-            if loc == 0:   # case when simulation does not exceed threshold
-                temp = self.total_time[N-1] - self.total_time[t-1]
-            else:#case when it exceeds threshold
-                temp = self.total_time[loc-1] - self.total_time[t-1]
+            if loc == 0:   # simulation does not exceed threshold
+                temp = self.total_time[N - 1] - self.total_time[t - 1]
+            else:          # exceeds threshold
+                temp = self.total_time[loc - 1] - self.total_time[t - 1]
             self.RUL.append(temp)
         return self.RUL
 
 
-
-
 def main(number_particles=5000, measured_crack=[]):
-    measured_crack = measured_crack
     all_predictions = []
-    number_particles = number_particles
-    part_obj = ParticleFilter(number_particles)
+    model = CrackGrowthModel()
+    pf = ParticleFilter(number_particles, model)
+
     measured_data_iterator = 0
     time_array = []
     init_time = 0
     average_crack = []
     average_variance = []
     prob_failure = []
-    weights = np.full(shape=number_particles, fill_value=1. / number_particles)
     mu, var = 0.0, 0.0
-    while mu < part_obj.threshold:
+
+    while mu < model.threshold:
         if measured_data_iterator < len(measured_crack):
             for meas in measured_crack:
-                # use the priors from the previous step to make prediction
-                part_obj.predict()
-                # update the priors using likelikehood and we obtain posterior
-                part_obj.update(weights=weights, measured=meas)
-                if part_obj.neff(weights) < number_particles / 2:
-                    part_obj.resampleFromIndex(weights)
-                    assert np.allclose(weights, 1 / number_particles)
-                all_predictions.append(part_obj.get_prediction())
-                mu, var = part_obj.estimate(weights)
-                if mu >= part_obj.threshold:
+                pf.predict()
+                pf.update(meas)
+                pf.resample_if_needed()
+                all_predictions.append(pf.get_particles()[:, 0])
+                mu, var = pf.estimate()
+                if mu >= model.threshold:
                     break
                 average_crack.append(mu)
                 average_variance.append(var)
                 init_time += 50
                 time_array.append(init_time)
                 measured_data_iterator += 1
-                prob_failure.append(part_obj.prognosis)
-
+                prob_failure.append(pf.prognosis(model.threshold))
         else:
-            # this is the prediction step we do not need to resample because
-            # there are no measurements to re-smaple and update the posterior
-            part_obj.predict()
-            part_obj.resampleFromIndex(weights)
-            mu, var = part_obj.estimate(weights)
-            all_predictions.append(part_obj.get_prediction())
-            if mu >= part_obj.threshold:
+            pf.predict()
+            pf.resample_if_needed()
+            mu, var = pf.estimate()
+            all_predictions.append(pf.get_particles()[:, 0])
+            if mu >= model.threshold:
                 break
             average_crack.append(mu)
             average_variance.append(var)
             init_time += 50
             time_array.append(init_time)
-            prob_failure.append(part_obj.prognosis)
+            prob_failure.append(pf.prognosis(model.threshold))
             measured_data_iterator += 1
 
     all_predictions = np.vstack(all_predictions)
@@ -168,6 +175,7 @@ def main(number_particles=5000, measured_crack=[]):
 
     Ub = [x + 1.96 * np.sqrt(y) for x, y in zip(average_crack, average_variance)]
     Lb = [0.0 if x - 1.96 * np.sqrt(y) < 0 else x - 1.96 * np.sqrt(y) for x, y in zip(average_crack, average_variance)]
+
     plt.figure()
     plt.plot(time_array, average_crack, 'b')
     plt.plot(time_array, Lb, "g")
@@ -176,17 +184,16 @@ def main(number_particles=5000, measured_crack=[]):
     plt.ylabel("Crack Size")
     plt.show()
 
-    # Fragility
     plt.figure()
     plt.plot(time_array, prob_failure, 'k')
     plt.xlabel("Cycles")
     plt.ylabel("Prob failure")
     plt.show()
 
-
     plt.figure()
     plt.hist(opt)
     plt.show()
+
 
 if __name__ == "__main__":
     measured_crack = [0.0119, 0.0103]
